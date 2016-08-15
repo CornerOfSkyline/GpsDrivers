@@ -44,6 +44,15 @@
 #include <string.h>
 #include <ctime>
 
+/**** Trace macros, disable for production builds */
+#define UFLY_TRACE_PARSER(...)	{/*GPS_INFO(__VA_ARGS__);*/}	/* decoding progress in parse_char() */
+#define UFLY_TRACE_RXMSG(...)		{/*GPS_INFO(__VA_ARGS__);*/}	/* Rx msgs in payload_rx_done() */
+#define UFLY_TRACE_SVINFO(...)	{/*GPS_INFO(__VA_ARGS__);*/}	/* NAV-SVINFO processing (debug use only, will cause rx buffer overflows) */
+
+/**** Warning macros, disable to save memory */
+#define UFLY_WARN(...)		{GPS_WARN(__VA_ARGS__);}
+#define UFLY_DEBUG(...)		{GPS_WARN(__VA_ARGS__);}
+
 /* CRC16 implementation acording to CCITT standards */
 
 static const uint16_t crc16tab[256] = {
@@ -108,6 +117,8 @@ GPSDriverUFLY::configure(unsigned &baudrate, OutputMode output_mode)
 
     baudrate = UFLY_BAUDRATE;
 
+    UFLY_DEBUG("UFLY baudrate set %d!",baudrate);
+
     return 0;
 }
 
@@ -119,35 +130,37 @@ GPSDriverUFLY::receive(unsigned timeout)
     /* timeout additional to poll */
     gps_abstime time_started = gps_absolute_time();
 
-    int j = 0;
+    int handled = 0;
 
     while (true) {
+        bool ready_to_return = _configured ? (_got_posllh && _got_velned) : handled;
 
         int ret = read(buf, sizeof(buf), timeout);
 
-        if (ret > 0) {
-            /* first read whatever is left */
-            if (j < ret) {
-                /* pass received bytes to the packet decoder */
-                while (j < ret) {
-                    if ((parse_ret = parseChar(buf[j])) > 0) {
-                        handleMessage(parse_ret);
-                        return 1;
-                    }
-
-                    j++;
-                }
-
-                /* everything is read */
-                j = 0;
+        if(ret < 0){
+            UFLY_WARN("UFLY poll_or_read err");
+            return -1;
+        } else if (ret == 0) {
+            if(ready_to_return){
+                _got_posllh = false;
+                _got_velned = false;
+                return handled;
             }
-
         } else {
-            usleep(20000);
+            UFLY_DEBUG("read %d bytes",ret);
+
+            for(int i = 0; i < ret; i++){
+                parse_ret = parseChar(buf[i]);
+                if(ret > 0)
+                {
+                    handled |= handleMessage(parse_ret);
+                }
+            }
         }
 
-        /* in case we keep trying but only get crap from GPS */
+        /* abort after timeout if no useful packets received */
         if (time_started + timeout * 1000 < gps_absolute_time()) {
+            UFLY_DEBUG("timed out, returning");
             return -1;
         }
     }
@@ -158,33 +171,45 @@ GPSDriverUFLY::parseChar(uint8_t b)
 {
     int ret = 0;
 
+    //UFLY_DEBUG("parseChar %X",b);
+
     switch(_decode_state)
     {
     case SBP_DECODE_SYNC:
         if(b == 0x55)
         {
+            _sbp_msg_id = 0;
+            _sbp_payload_receive_length = 0;
             _decode_state = SBP_DECODE_MSG_ID1;
         }
         break;
     case SBP_DECODE_MSG_ID1:
         _sbp_msg_id = b;
+        _sbp_payload_receive_length = 0;
         _decode_state = SBP_DECODE_MSG_ID2;
         break;
     case SBP_DECODE_MSG_ID2:
         _sbp_msg_id |= b << 8u;
+        _sbp_payload_receive_length = 0;
         _decode_state = SBP_DECODE_MSG_SENDER1;
+        //UFLY_DEBUG("MSG_ID = %02X",_sbp_msg_id);
         break;
     case SBP_DECODE_MSG_SENDER1:
         _sbp_msg_sender = b;
+        _sbp_payload_receive_length = 0;
         _decode_state = SBP_DECODE_MSG_SENDER2;
         break;
     case SBP_DECODE_MSG_SENDER2:
         _sbp_msg_sender |= b << 8u;
+        _sbp_payload_receive_length = 0;
         _decode_state = SBP_DECODE_PAYLOAD_LENGTH;
+        //UFLY_DEBUG("MSG_SENDER = %02X",_sbp_msg_sender);
         break;
     case SBP_DECODE_PAYLOAD_LENGTH:
         _sbp_payload_length = b;
+        _sbp_payload_receive_length = 0;
         _decode_state = SBP_DECODE_PAYLOAD;
+        //UFLY_DEBUG("MSG_LENGTH = %X",_sbp_payload_length);
         break;
     case SBP_DECODE_PAYLOAD:
         switch(_sbp_msg_id)
@@ -221,7 +246,17 @@ GPSDriverUFLY::parseChar(uint8_t b)
                 _decode_state = SBP_DECODE_CRC1;
             }
             break;
+        case SBP_MSG_HEARTBEAT:
+            *((uint8_t *)&msg_heartbeat + _sbp_payload_receive_length) = b;
+            _sbp_payload_receive_length ++;
+            if(_sbp_payload_receive_length == _sbp_payload_length)
+            {
+                _decode_state = SBP_DECODE_CRC1;
+            }
+            break;
         default :
+            ret = SBP_MSG_ERROR;
+            //UFLY_DEBUG("Default msg received!")
             break;
         }
         break;
@@ -240,7 +275,10 @@ GPSDriverUFLY::parseChar(uint8_t b)
             _sbp_crc = crc16_ccitt(&_sbp_payload_length,1,_sbp_crc);
             _sbp_crc = crc16_ccitt((uint8_t *)&msg_gps_time,_sbp_payload_length,_sbp_crc);
             if(_sbp_crc == _sbp_msg_crc)
+            {
                 ret = SBP_MSG_GPS_TIME;
+                //UFLY_DEBUG("Time crc ok!")
+            }
             else
                 ret = SBP_CRC_ERROR;
             break;
@@ -250,7 +288,10 @@ GPSDriverUFLY::parseChar(uint8_t b)
             _sbp_crc = crc16_ccitt(&_sbp_payload_length,1,_sbp_crc);
             _sbp_crc = crc16_ccitt((uint8_t *)&msg_pos_llh,_sbp_payload_length,_sbp_crc);
             if(_sbp_crc == _sbp_msg_crc)
+            {
                 ret = SBP_MSG_POS_LLH;
+                //UFLY_DEBUG("Pos LLH crc ok!")
+            }
             else
                 ret = SBP_CRC_ERROR;
             break;
@@ -260,7 +301,10 @@ GPSDriverUFLY::parseChar(uint8_t b)
             _sbp_crc = crc16_ccitt(&_sbp_payload_length,1,_sbp_crc);
             _sbp_crc = crc16_ccitt((uint8_t *)&msg_vel_ned,_sbp_payload_length,_sbp_crc);
             if(_sbp_crc == _sbp_msg_crc)
+            {
                 ret = SBP_MSG_VEL_NED;
+                //UFLY_DEBUG("Vel Ned crc ok!")
+            }
             else
                 ret = SBP_CRC_ERROR;
             break;
@@ -270,11 +314,27 @@ GPSDriverUFLY::parseChar(uint8_t b)
             _sbp_crc = crc16_ccitt(&_sbp_payload_length,1,_sbp_crc);
             _sbp_crc = crc16_ccitt((uint8_t *)&msg_dpos,_sbp_payload_length,_sbp_crc);
             if(_sbp_crc == _sbp_msg_crc)
+            {
                 ret = SBP_MSG_DOPS;
+                //UFLY_DEBUG("DOPS crc ok!")
+            }
             else
                 ret = SBP_CRC_ERROR;
             break;
+        case SBP_MSG_HEARTBEAT:
+            _sbp_crc = crc16_ccitt((uint8_t *)&_sbp_msg_id,2,0);
+            _sbp_crc = crc16_ccitt((uint8_t *)&_sbp_msg_sender,2,_sbp_crc);
+            _sbp_crc = crc16_ccitt(&_sbp_payload_length,1,_sbp_crc);
+            _sbp_crc = crc16_ccitt((uint8_t *)&msg_heartbeat,_sbp_payload_length,_sbp_crc);
+            if(_sbp_crc == _sbp_msg_crc)
+            {
+                ret = SBP_MSG_HEARTBEAT;
+                //UFLY_DEBUG("Heartbeat crc ok!")
+            }
+            else
+                ret = SBP_CRC_ERROR;
         default:
+            ret = SBP_MSG_ERROR;
             break;
         }
         break;
@@ -285,22 +345,31 @@ GPSDriverUFLY::parseChar(uint8_t b)
     return ret;
 }
 
-void
+uint32_t
 GPSDriverUFLY::handleMessage(int32_t msg_id)
 {
+    uint32_t ret = 0;
     switch(msg_id)
     {
+    case SBP_MSG_HEARTBEAT:
+        last_heatbeat_received_ms = gps_absolute_time();
+        break;
     case SBP_MSG_GPS_TIME:
+        _gps_position->time_utc_usec = time_epoch_convert(msg_gps_time.wn,msg_gps_time.tow);
         break;
     case SBP_MSG_DOPS:
         _gps_position->hdop = msg_dpos.hdop;
         _gps_position->vdop = msg_dpos.vdop;
+        //UFLY_WARN("hdop = %f",msg_dpos.hdop);
+        //UFLY_WARN("hdop = %f",msg_dpos.vdop);
         break;
     case SBP_MSG_POS_LLH:
         _gps_position->lat = msg_pos_llh.lat * 1e7;
         _gps_position->lon = msg_pos_llh.lon * 1e7;
         _gps_position->eph = msg_pos_llh.h_accuracy * 1e-3;
         _gps_position->epv = msg_pos_llh.v_accuracy * 1e-3;
+        UFLY_WARN("eph = %d",msg_pos_llh.h_accuracy);
+        UFLY_WARN("epv = %d",msg_pos_llh.v_accuracy);
         switch(msg_pos_llh.flags & 0x07)
         {
         case 0x00:
@@ -323,11 +392,25 @@ GPSDriverUFLY::handleMessage(int32_t msg_id)
             _gps_position->alt_ellipsoid = msg_pos_llh.height * 1e3;
 
         _gps_position->satellites_used = msg_pos_llh.n_sats;
+
+        UFLY_WARN("llh.flags = %02X",msg_pos_llh.flags);
+        UFLY_WARN("alt = %f",msg_pos_llh.height);
+
+        _got_posllh = true;
+        ret = 1;
         break;
     case SBP_MSG_VEL_NED:
         _gps_position->vel_n_m_s = msg_vel_ned.n * 1e-3;
         _gps_position->vel_e_m_s = msg_vel_ned.e * 1e-3;
         _gps_position->vel_d_m_s = msg_vel_ned.d * 1e-3;
+
+        _gps_position->timestamp_time		= gps_absolute_time();
+        _gps_position->timestamp_velocity 	= gps_absolute_time();
+        _gps_position->timestamp_variance 	= gps_absolute_time();
+        _gps_position->timestamp_position	= gps_absolute_time();
+
+        _got_velned = true;
+        ret = 1;
 
         // Position and velocity update always at the same time
         _rate_count_vel++;
@@ -336,8 +419,8 @@ GPSDriverUFLY::handleMessage(int32_t msg_id)
         break;
     default:
         break;
-    return;
 }
+    return ret;
 }
 
 /** Calculate CCITT 16-bit Cyclical Redundancy Check (CRC16).
@@ -363,3 +446,15 @@ GPSDriverUFLY::crc16_ccitt(const uint8_t *buf, uint32_t len, uint16_t crc)
         crc = (crc << 8) ^ crc16tab[((crc >> 8) ^ *buf++) & 0x00FF];
     return crc;
 }
+
+/**
+   convert GPS week and milliseconds to unix epoch in milliseconds
+ */
+uint64_t GPSDriverUFLY::time_epoch_convert(uint16_t gps_week, uint32_t gps_ms)
+{
+    const uint64_t ms_per_week = 7000ULL*86400ULL;
+    const uint64_t unix_offset = 17000ULL*86400ULL + 52*10*7000ULL*86400ULL - 15000ULL;
+    uint64_t fix_time_ms = unix_offset + gps_week*ms_per_week + gps_ms;
+    return fix_time_ms;
+}
+

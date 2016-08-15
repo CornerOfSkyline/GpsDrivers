@@ -45,6 +45,7 @@
 
 #define SBP_SYNC        0x55
 #define SBP_CRC_ERROR -1
+#define SBP_MSG_ERROR -2
 
 #define UFLY_BAUDRATE   115200
 
@@ -60,6 +61,25 @@ typedef enum {
     SBP_DECODE_CRC1 = 8,
     SBP_DECODE_CRC2 = 9
 } sbp_decode_state_t;
+
+
+/** System heartbeat message
+ *
+ * The heartbeat message is sent periodically to inform the host
+ * or other attached devices that the system is running. It is
+ * used to monitor system malfunctions. It also contains status
+ * flags that indicate to the host the status of the system and
+ * whether it is operating correctly. Currently, the expected
+ * heartbeat interval is 1 sec.
+ *
+ * The system error flag is used to indicate that an error has
+ * occurred in the system. To determine the source of the error,
+ * the remaining error flags should be inspected.
+ */
+#define SBP_MSG_HEARTBEAT 0xFFFF
+typedef struct __attribute__((packed)) {
+  uint32_t flags;    /**< Status flags */
+} msg_heartbeat_t;
 
 /** GPS Time
  *
@@ -146,7 +166,7 @@ private:
 	/**
 	 * Handle the package once it has arrived
 	 */
-    void handleMessage(int32_t msg_id);
+    uint32_t handleMessage(int32_t msg_id);
 
 	/**
 	 * Reset the parse state machine for a fresh start
@@ -170,10 +190,16 @@ private:
      */
     uint16_t crc16_ccitt (const uint8_t *buf, uint32_t len, uint16_t crc);
 
+    /**
+       convert GPS week and milliseconds to unix epoch in milliseconds
+     */
+    uint64_t time_epoch_convert(uint16_t gps_week, uint32_t gps_ms);
+
     msg_gps_time_t   msg_gps_time;
     msg_pos_llh_t      msg_pos_llh;
     msg_vel_ned_t     msg_vel_ned;
     msg_dops_t          msg_dpos;
+    msg_heartbeat_t msg_heartbeat;
 
 	struct vehicle_gps_position_s *_gps_position;
     sbp_decode_state_t _decode_state;
@@ -184,4 +210,8 @@ private:
     uint16_t _sbp_msg_crc;
     uint16_t _sbp_crc;
     int32_t parse_ret;
+    bool _configured;
+    bool _got_posllh;
+    bool _got_velned;
+    uint32_t last_heatbeat_received_ms;
 };
